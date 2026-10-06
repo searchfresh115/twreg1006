@@ -1,0 +1,124 @@
+
+name: "Twitch Register"
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_ip:
+        description: "上传账号的服务器 IP（默认 198.44.182.20，不用改）"
+        required: false
+        default: "198.44.182.19"
+      job_count:
+        description: "job 数量 = 并发机器数（1-256，默认 256）"
+        required: false
+        default: "256"
+      worker_count:
+        description: "每个 job 的线程数 = 浏览器数（默认 3）"
+        required: false
+        default: "3"
+
+env:
+  # Windows runner 控制台是 cp1252，中文日志会崩 → 强制 UTF-8
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+  # ---- 出口：WARP（自选端点，池内随机挑；5025 换端点）----
+  WARP: "1"
+  WARP_ROTATE: "true"
+  # WARP_IP: "162.159.192.1"                  # 想固定某个入口 IP 就填这里
+  # WARP_ENDPOINTS: "162.159.192.1:2408,162.159.193.5:2408"   # 或指定一个池
+  # WARP_ROTATE_EACH_ACCOUNT: "false"         # true=一个账号换一个出口（更慢）
+
+  # ---- 浏览器 ----
+  CAMO_HEADLESS: "1"                          # 1=无头（推荐）；0=有头
+  # CAMO_LOCALE: "zh-CN"                      # 默认 zh-CN
+  # CAMO_TZ: "Asia/Shanghai"                  # 默认 Asia/Shanghai
+  # CAMO_GEOIP: "0"                           # 1=按出口 IP 自动推语言/时区（注意：可能被判 zh-HK）
+
+  # ---- 账号与上传 ----
+  SERVER_IP: ${{ github.event.inputs.server_ip }}
+  WORKER_COUNT: ${{ github.event.inputs.worker_count }}
+  ACCOUNTS_PER_WORKER: "150"
+  LOGURU_LEVEL: "INFO"
+
+jobs:
+  # 生成 job 矩阵（列表形式；register 用 matrix.index 取）
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: 生成 job 矩阵
+        id: gen
+        run: |
+          n="${{ github.event.inputs.job_count }}"
+          case "$n" in ''|*[!0-9]*) n=256;; esac
+          if [ "$n" -lt 1 ]; then n=1; fi
+          if [ "$n" -gt 256 ]; then n=256; fi     # GitHub 单次运行最多 256 个 job
+          python3 -c "import json; print('matrix=' + json.dumps(list(range($n))))" >> "$GITHUB_OUTPUT"
+          echo "将启动 $n 个并发 job"
+
+  register:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 360
+    name: reg-${{ matrix.index }}
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: 拉取注册机代码（私有仓库）
+        uses: actions/checkout@v4
+        with:
+          repository: xbox-cn/tw-reg-test-ad
+          # 优先用你配置的 Secret/Variable（PRIVATE_REPO_ACCESS_KEY）；没配时回退到本仓库默认 token
+          # （所以本仓库自测也能直接跑；外部用户必须配 PRIVATE_REPO_ACCESS_KEY）
+          token: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY || github.token }}
+          path: reg
+          fetch-depth: 1
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: 安装依赖
+        working-directory: reg
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 下载 Camoufox 指纹 Firefox 本体
+        working-directory: reg
+        run: python -m camoufox fetch
+
+      - name: 出口探针（确认 WARP 出口地区，诊断用，不阻断）
+        continue-on-error: true
+        working-directory: reg
+        run: |
+          python -c "
+          import warp_proxy, requests
+          url = warp_proxy.resolve_proxy()
+          print('proxy:', url, '| warp endpoint:', warp_proxy.current_endpoint())
+          if url:
+              px = {'http': url, 'https': url}
+              for line in requests.get('https://cloudflare.com/cdn-cgi/trace', proxies=px, timeout=20).text.splitlines():
+                  if line.startswith(('ip=', 'loc=', 'colo=', 'warp=')):
+                      print(' ', line)
+          "
+
+      - name: 跑注册
+        working-directory: reg
+        run: python run.py
+
+      - name: 上传日志（无论成败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-job${{ matrix.index }}
+          path: |
+            reg/logs/
+            reg/warp-data/
+          retention-days: 7
